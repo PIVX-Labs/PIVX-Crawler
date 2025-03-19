@@ -1,0 +1,11 @@
+[package]
+name = "pivx-crawler"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bytes = "1.10.1"
+hex = "0.4.3"
+rand = "0.9.0"
+sha2 = "0.10.8"
+tokio = { version = "1.44.1", features = ["io-util", "macros", "net", "rt", "rt-multi-thread"] }
