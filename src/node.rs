@@ -121,6 +121,54 @@ impl Node {
         Ok(())
     }
 
+    pub async fn send_getblocks(&self, stream: &mut TcpStream, locators: &Vec<[u8; 32]>) -> Result<(), Box<dyn Error>> {
+        let mut payload = BytesMut::with_capacity(81);
+        payload.put_u32_le(PROTOCOL_VERSION);
+        payload.put_u8(locators.len() as u8);
+        for hash in locators {
+            payload.extend_from_slice(hash);
+        }
+        payload.extend_from_slice(&[0u8; 32]);
+        Message::fill(stream, *b"getblocks\0\0\0", &payload).await
+    }
+
+    pub async fn send_getdata(&self, stream: &mut TcpStream, block_hashes: &[[u8; 32]]) -> Result<(), Box<dyn Error>> {
+        let mut payload = BytesMut::with_capacity(37 * block_hashes.len());
+        payload.put_u8(block_hashes.len() as u8);
+        for hash in block_hashes {
+            // MSG_BLOCK to request full block data, 1 for TX
+            payload.put_u32_le(2);
+            payload.extend_from_slice(hash);
+        }
+        Message::fill(stream, *b"getdata\0\0\0\0\0", &payload).await
+    }
+
+    pub async fn receive_block(&self, stream: &mut TcpStream) -> Result<[u8; 32], Box<dyn Error>> {
+        let payload = self.get_payload(stream, Some(*b"block\0\0\0\0\0\0\0")).await?;
+        let mut cursor = Cursor::new(payload);
+        let mut block_hash = [0u8; 32];
+        cursor.read_exact(&mut block_hash).await?;
+        Ok(block_hash)
+    }
+
+    pub async fn receive_inv(&self, stream: &mut TcpStream) -> Result<Vec<[u8; 32]>, Box<dyn Error>> {
+        let payload = self.get_payload(stream, Some(*b"inv\0\0\0\0\0\0\0\0\0")).await?;
+        let mut cursor = Cursor::new(payload);
+        let count = read_varint(&mut cursor)?;
+        let mut hashes = Vec::new();
+        for _ in 0..count {
+            let mut entry = [0u8; 36];
+            cursor.read_exact(&mut entry).await?;
+            if u32::from_le_bytes(entry[0..4].try_into()?) == 2 {
+                let mut hash = [0u8; 32];
+                hash.copy_from_slice(&entry[4..]);
+                hash.reverse();
+                hashes.push(hash);
+            }
+        }
+        Ok(hashes)
+    }
+
     /**
      * if command is None, return the first message we receive
      * if it's Some(payload), discard all messages until we get the desired one
