@@ -11,6 +11,7 @@ use tokio::net::TcpStream;
 
 use crate::message::Message;
 use crate::utils::read_varint;
+use crate::webhook::Webhook;
 
 fn ipv4_to_ipv6_mapped(ipv4: Ipv4Addr) -> Ipv6Addr {
     let octets = ipv4.octets();
@@ -34,7 +35,7 @@ pub const USER_AGENT: &str = "/DUDDINOSCRAWLER:0.1/";
 // Only get nodes that have sent a message in the `TIME_CUTOFF` seconds
 pub const TIME_CUTOFF: i64 = 28800;
 
-#[derive(Debug, Eq, PartialEq, Hash)]
+#[derive(Debug, Eq, PartialEq, Hash, Clone)]
 pub enum Ip {
     Ip4(String),
     Ip6(String),
@@ -50,6 +51,8 @@ impl AsRef<str> for Ip {
         }
     }
 }
+
+type BlockHash = [u8; 32];
 
 pub struct Node {
     pub ip: Ip,
@@ -239,23 +242,52 @@ impl Node {
             "Block height is: {}",
             self.get_block_height(&version_payload).await?
         );
-        self.send_sendaddrv2(&mut stream).await?;
         self.send_verack(&mut stream).await?;
-        // Discard verack message
-        self.get_payload(&mut stream, Some(*b"verack\0\0\0\0\0\0"))
-            .await?;
+        self.get_payload(&mut stream, Some(*b"verack\0\0\0\0\0\0")).await?;
+    
+        self.send_sendaddrv2(&mut stream).await?;
 
         let mut peers = HashMap::new();
-
-        for i in 0..5 {
+    
+        // Get IP addresses of nodes peers
+        for _ in 0..3 {
             self.send_getaddr(&mut stream).await?;
-            self.send_getaddr(&mut stream).await?;
-            let payload = self
-                .get_payload(&mut stream, Some(*b"addrv2\0\0\0\0\0\0"))
-                .await?;
-            self.extract_ips(&payload, &mut peers).await?;
+            if let Ok(payload) = self.get_payload(&mut stream, Some(*b"addrv2\0\0\0\0\0\0")).await {
+                self.extract_ips(&payload, &mut peers).await?;
+            } else {
+                println!("Warning: Failed to receive addr response, continuing...");
+                continue;
+            }
         }
-        Ok(peers)
+    
+        // Check blockbook for latest data
+        let best_block_hash = fetch_latest_block_hash_from_explorer().await?;
+        // Map to store peer IPs with heights and recent hashes
+        let mut peer_updates: HashMap<Ip, (u32, Vec<BlockHash>)> = HashMap::new();
+        for peer_ip in peers.keys() {
+            // Connect once per peer
+            let Ok(mut peer_stream) = TcpStream::connect(format!("{}:51472", peer_ip.as_ref())).await else {
+                println!("Failed to connect to peer {}", peer_ip.as_ref());
+                continue;
+            };
+            if self.handshake_with_peer(&mut peer_stream).await.is_err() {
+                println!("Handshake failed for peer {}", peer_ip.as_ref());
+                continue;
+            }
+            if let Ok(peer_hashes) = self.fetch_recent_block_hashes(&mut peer_stream, best_block_hash, 10).await {
+                peer_updates.insert(peer_ip.clone(), (peer_height, peer_hashes));
+            }
+        }        
+        Ok(peer_updates)
+    }
+
+    // Simplified peer handshake setup
+    pub async fn handshake_with_peer(&self, stream: &mut TcpStream) -> Result<(), Box<dyn Error>> {
+        self.send_version(stream).await?;
+        self.get_payload(stream, Some(*b"version\0\0\0\0\0")).await?;
+        self.send_verack(stream).await?;
+        self.get_payload(stream, Some(*b"verack\0\0\0\0\0\0")).await?;
+        Ok(())
     }
 
     pub async fn extract_ips(
@@ -304,4 +336,94 @@ impl Node {
         }
         Ok(())
     }
+    
+    pub async fn fetch_recent_block_hashes(
+        &self,
+        stream: &mut TcpStream,
+        locator: BlockHash,
+        count: usize,
+    ) -> Result<Vec<BlockHash>, Box<dyn Error>> {
+        let mut hashes = Vec::new();
+        let mut current_locator = vec![locator];
+    
+        while hashes.len() < count {
+            self.send_getblocks(stream, &current_locator).await?;
+            let new_hashes = self.receive_inv(stream).await?;
+    
+            if new_hashes.is_empty() {
+                break;
+            }
+    
+            hashes.extend(new_hashes.iter().take(count - hashes.len()));
+    
+            current_locator = vec![*new_hashes.last().unwrap()];
+        }
+    
+        Ok(hashes)
+    }
+
+    pub async fn check_and_alert_forks(
+    peers: &HashMap<Ip, (u32, Vec<BlockHash>)>,
+    webhook: &Webhook,
+) -> Result<(), Box<dyn Error>> {
+    let groups = group_peers_by_exact_hash(peers);
+    if groups.len() > 1 {
+        let msg = format_fork_message_by_hash(peers, &groups);
+        webhook.send_embed("Blockchain Fork Detected", &msg, 0xFF0000).await?;
+    }
+    Ok(())
+}
+
+pub fn format_fork_message_by_hash(
+    peers: &HashMap<Ip, (u32, Vec<BlockHash>)>,
+    groups: &HashMap<BlockHash, Vec<Ip>>,
+) -> String {
+    let mut msg = String::from("⚠️ **Forked Chain Groups Detected**\n\n");
+
+    for (hash, ips) in groups.iter() {
+        let hash_display = if *hash == [0u8;32] { "N/A".to_string() } else { hex::encode(hash) };
+        msg += &format!("🔗 Fork (Hash: `{}`):\n", hash_display);
+
+        for ip in ips {
+            if let Some((height, _)) = peers.get(ip) {
+                msg += &format!("• {} → Height: `{}`\n", ip.as_ref(), height);
+            }
+        }
+
+        msg += "\n";
+    }
+
+    msg
+}
+
+pub fn group_peers_by_exact_hash(peers: &HashMap<Ip, (u32, Vec<BlockHash>)>) -> HashMap<BlockHash, Vec<Ip>> {
+    let mut groups: HashMap<BlockHash, Vec<Ip>> = HashMap::new();
+
+    for (ip, (_height, hashes)) in peers {
+        if let Some(last_hash) = hashes.first() {
+            groups.entry(*last_hash).or_default().push(ip.clone());
+        } else {
+            groups.entry([0u8; 32]).or_default().push(ip.clone()); // "N/A" or "unknown" hashes/heights
+        }
+    }
+
+    groups
+}
+
+pub async fn fetch_latest_block_hash_from_explorer() -> Result<[u8; 32], Box<dyn Error>> {
+    let url = "https://explorer.duddino.com/api/status";
+    let res = reqwest::get(url).await?.json::<serde_json::Value>().await?;
+
+    if let Some(hash_hex) = res["backend"]["bestBlockHash"].as_str() {
+        let mut hash = [0u8; 32];
+        if let Ok(decoded) = hex::decode(hash_hex) {
+            if decoded.len() == 32 {
+                hash.copy_from_slice(&decoded);
+                hash.reverse();
+                return Ok(hash);
+            }
+        }
+    }
+
+    Err("Failed to retrieve or parse bestBlockHash".into())
 }
