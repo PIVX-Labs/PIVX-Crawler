@@ -231,16 +231,17 @@ impl Node {
         Ok(payload.read_u32_le().await?)
     }
 
-    pub async fn get_peers(&self) -> Result<HashMap<Ip, u32>, Box<dyn Error>> {
+    pub async fn get_peers(&self) -> Result<HashMap<Ip, (u32, Vec<BlockHash>)>, Box<dyn Error>> {
         let mut stream = TcpStream::connect(format!("{}:51472", self.ip.as_ref())).await?;
         self.send_version(&mut stream).await?;
         // Discard version message, we really don't care
         let version_payload = self
             .get_payload(&mut stream, Some(*b"version\0\0\0\0\0"))
             .await?;
+        let peer_height = self.get_block_height(&version_payload).await?;
         println!(
             "Block height is: {}",
-            self.get_block_height(&version_payload).await?
+            peer_height
         );
         self.send_verack(&mut stream).await?;
         self.get_payload(&mut stream, Some(*b"verack\0\0\0\0\0\0")).await?;
@@ -361,18 +362,19 @@ impl Node {
     
         Ok(hashes)
     }
+}
 
     pub async fn check_and_alert_forks(
-    peers: &HashMap<Ip, (u32, Vec<BlockHash>)>,
-    webhook: &Webhook,
-) -> Result<(), Box<dyn Error>> {
-    let groups = group_peers_by_exact_hash(peers);
-    if groups.len() > 1 {
-        let msg = format_fork_message_by_hash(peers, &groups);
-        webhook.send_embed("Blockchain Fork Detected", &msg, 0xFF0000).await?;
+        peers: &HashMap<Ip, (u32, Vec<BlockHash>)>,
+        webhook: &Webhook,
+    ) -> Result<(), Box<dyn Error>> {
+        let groups = group_peers_by_exact_hash(peers);
+        if groups.len() > 1 {
+            let msg = format_fork_message_by_hash(peers, &groups);
+            webhook.send_embed("Blockchain Fork Detected", &msg, 0xFF0000).await?;
+        }
+        Ok(())
     }
-    Ok(())
-}
 
 pub fn format_fork_message_by_hash(
     peers: &HashMap<Ip, (u32, Vec<BlockHash>)>,
