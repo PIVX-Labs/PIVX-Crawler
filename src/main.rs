@@ -9,17 +9,31 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use webhook::Webhook;
 
+// Usage: pivx-crawler [--testnet] [--magic=<hex>] [seed-address]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let node = Node {
-        ip: Ip::Ip4("194.195.87.248".to_string()),
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut net = if args.iter().any(|a| a == "--testnet") {
+        message::TESTNET
+    } else {
+        message::MAINNET
     };
-    let peers = node.get_peers().await?;
+    if let Some(hex) = args.iter().find_map(|a| a.strip_prefix("--magic=")) {
+        net.magic = u32::from_str_radix(hex, 16)?;
+    }
+    message::set_network(net);
+    // 194.195.87.248 no longer answers. A dead seed yields an empty result, not an
+    // error, so pass a live one as the first non-flag argument.
+    let seed = args
+        .iter()
+        .find(|a| !a.starts_with("--"))
+        .cloned()
+        .unwrap_or_else(|| "194.195.87.248".to_string());
 
-    // A Discord webhook URL is a bearer credential: anyone holding it can post as the bot.
-    // It was hardcoded here; keep it out of the repo.
+    let node = Node { ip: Ip::Ip4(seed) };
+    let (_addresses, peers) = node.get_peers().await?;
+
     let webhook = Webhook::new(&std::env::var("CRAWLER_DISCORD_WEBHOOK")?);
-    // Detect groupings where there's a large enough gap
     check_and_alert_forks(&peers, &webhook).await?;
     Ok(())
 }
