@@ -12,6 +12,10 @@ pub struct Network {
     /// Blockbook v2 compatible status endpoint. Fork detection needs a trusted tip, and
     /// a mainnet explorer cannot supply one for testnet.
     pub explorer: &'static str,
+    /// Drop addresses older than this. getaddr samples addrman, whose timestamps age at
+    /// the rate peers actually churn, so the useful window follows the network rather
+    /// than the clock.
+    pub addr_max_age: i64,
 }
 
 /// pchMessageStart and nDefaultPort from CMainParams, chainparams.cpp:318.
@@ -19,6 +23,7 @@ pub const MAINNET: Network = Network {
     magic: 0x90c4fde9,
     port: 51472,
     explorer: "https://explorer.pivx.org",
+    addr_max_age: 3 * 24 * 60 * 60,
 };
 
 /// CTestNetParams, chainparams.cpp:464-467.
@@ -29,6 +34,10 @@ pub const TESTNET: Network = Network {
     magic: 0xf6e7d6cb,
     port: 51474,
     explorer: "https://testnet-explorer.liquid369.wtf",
+    // testnet6 was at height 24,504 on 2026-09-08, 131 days after genesis: about 7.7
+    // minutes a block against a 60s target. With that little churn on a fleet this size,
+    // 3 days returned zero addresses from a node that had 33.
+    addr_max_age: 30 * 24 * 60 * 60,
 };
 
 static NETWORK: OnceLock<Network> = OnceLock::new();

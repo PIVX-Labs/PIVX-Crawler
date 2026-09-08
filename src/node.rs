@@ -37,9 +37,7 @@ pub const USER_AGENT: &str = "/DUDDINOSCRAWLER:0.1/";
 // getaddr samples addrman, not recently seen peers, so a short window discards most of
 // the reply: at 8h one mainnet node's 1000 addresses all fell out. Core does not
 // age-filter what it receives; addrman keeps entries for ADDRMAN_HORIZON_DAYS of 30.
-// 3 days counts what the network currently believes is live without accepting the
-// month-old tail.
-pub const TIME_CUTOFF: i64 = 3 * 24 * 60 * 60;
+// The window is per network, see Network::addr_max_age.
 
 // BIP155 network ids and their fixed address lengths. A length disagreeing with the id
 // is malformed; Core throws, this drops the entry.
@@ -144,6 +142,18 @@ fn onion_v3_address(pubkey: &[u8; 32]) -> String {
     addr[32..34].copy_from_slice(&checksum[..2]);
     addr[34] = 0x03;
     format!("{}.onion", base32_lower(&addr))
+}
+
+fn bip155_name(id: u8) -> &'static str {
+    match id {
+        BIP155_IPV4 => "ipv4",
+        BIP155_IPV6 => "ipv6",
+        BIP155_TORV2 => "torv2",
+        BIP155_TORV3 => "torv3",
+        BIP155_I2P => "i2p",
+        BIP155_CJDNS => "cjdns",
+        _ => "unknown",
+    }
 }
 
 /// None drops the entry: wrong length for the id, dead Tor v2, or an unknown id.
@@ -369,6 +379,20 @@ impl Node {
         payload: &[u8],
         ips: &mut HashMap<Ip, u32>,
     ) -> Result<(), Box<dyn Error>> {
+        let mut ids = HashMap::new();
+        let mut stale = 0;
+        self.extract_ips_counted(payload, ips, &mut ids, &mut stale).await
+    }
+
+    /// Counts every BIP155 id seen, including ones dropped as stale or undecodable, so a
+    /// family missing from the census can be told apart from a family the peer never sent.
+    pub async fn extract_ips_counted(
+        &self,
+        payload: &[u8],
+        ips: &mut HashMap<Ip, u32>,
+        seen_ids: &mut HashMap<u8, usize>,
+        stale: &mut usize,
+    ) -> Result<(), Box<dyn Error>> {
         let mut payload = Cursor::new(payload);
         let ip_length = read_varint(&mut payload)?;
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
@@ -377,6 +401,7 @@ impl Node {
             let time = payload.read_u32_le().await?;
             read_varint(&mut payload)?; // skip services
             let network_id = payload.read_u8().await?;
+            *seen_ids.entry(network_id).or_default() += 1;
 
             let addr_len = read_varint(&mut payload)?;
             if addr_len > MAX_ADDRV2_SIZE {
@@ -389,8 +414,8 @@ impl Node {
             payload.read_exact(&mut addr).await?;
             payload.read_u16().await?; // port, big endian; the crawler dials the default
 
-            // Only get nodes within TIME_CUTOFF, or we may get a bunch of garbage
-            if i64::abs((time as i64) - (now as i64)) > TIME_CUTOFF {
+            if i64::abs((time as i64) - (now as i64)) > network().addr_max_age {
+                *stale += 1;
                 continue;
             }
             if let Some(ip) = decode_bip155_addr(network_id, &addr) {
@@ -429,12 +454,17 @@ impl Node {
         // over, so asking again mid-wait discards the reply being assembled. It splits
         // large replies across messages, so drain until the peer goes quiet.
         self.send_getaddr(&mut stream).await?;
+        let mut seen_ids: HashMap<u8, usize> = HashMap::new();
+        let mut stale = 0usize;
         loop {
             match self
                 .get_payload_within(&mut stream, Some(*b"addrv2\0\0\0\0\0\0"), ADDR_WAIT)
                 .await
             {
-                Ok(payload) => self.extract_ips(&payload, &mut peers).await?,
+                Ok(payload) => {
+                    self.extract_ips_counted(&payload, &mut peers, &mut seen_ids, &mut stale)
+                        .await?
+                }
                 Err(_) => break,
             }
         }
@@ -450,6 +480,10 @@ impl Node {
             *by_family.entry(ip.family()).or_default() += 1;
         }
         println!("found {} addresses, by family: {:?}", peers.len(), by_family);
+        // Distinguishes "the peer sent no onion addresses" from "we dropped them".
+        let mut ids: Vec<_> = seen_ids.iter().map(|(k, v)| (bip155_name(*k), *v)).collect();
+        ids.sort();
+        println!("addrv2 ids received: {ids:?}, dropped as stale: {stale}");
 
         // Check blockbook for latest data
         let Ok(best_block_hash) = fetch_latest_block_hash_from_explorer().await else {
@@ -933,7 +967,7 @@ mod tests {
 
     #[tokio::test]
     async fn applies_time_cutoff_to_every_family() {
-        let stale = now() - (TIME_CUTOFF as u32) - 60;
+        let stale = now() - (network().addr_max_age as u32) - 60;
         let ips = parse(&addrv2(&[
             entry(stale, BIP155_IPV4, &[1, 2, 3, 4], None),
             entry(stale, BIP155_TORV3, &[0xaa; 32], None),
