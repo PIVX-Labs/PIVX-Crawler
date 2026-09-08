@@ -33,8 +33,12 @@ pub const PROTOCOL_VERSION: u32 = 70927;
 // no capabilities
 pub const NODE_CAPABILITIES: u64 = 0;
 pub const USER_AGENT: &str = "/DUDDINOSCRAWLER:0.1/";
-// Only get nodes that have sent a message in the `TIME_CUTOFF` seconds
-pub const TIME_CUTOFF: i64 = 28800;
+// getaddr samples addrman, not recently seen peers, so a short window discards most of
+// the reply: at 8h one mainnet node's 1000 addresses all fell out. Core does not
+// age-filter what it receives; addrman keeps entries for ADDRMAN_HORIZON_DAYS of 30.
+// 3 days counts what the network currently believes is live without accepting the
+// month-old tail.
+pub const TIME_CUTOFF: i64 = 3 * 24 * 60 * 60;
 
 // BIP155 network ids and their fixed address lengths. A length disagreeing with the id
 // is malformed; Core throws, this drops the entry.
@@ -53,6 +57,11 @@ const TORV2_IN_IPV6_PREFIX: [u8; 6] = [0xfd, 0x87, 0xd8, 0x7e, 0xeb, 0x43];
 
 // MAX_PROTOCOL_MESSAGE_LENGTH, PIVX Core net.h:78.
 const MAX_PROTOCOL_MESSAGE_LENGTH: usize = 2 * 1024 * 1024;
+
+// Core defers its getaddr reply to the next address broadcast, PoissonNextSend over
+// AVG_ADDRESS_BROADCAST_INTERVAL of 30s (net_processing.cpp:2430, validation.h:109).
+// A wait shorter than the tail of that distribution reports an empty network.
+const ADDR_WAIT: Duration = Duration::from_secs(90);
 
 // MAX_SUBVERSION_LENGTH, PIVX Core.
 const MAX_SUBVERSION_LENGTH: u64 = 256;
@@ -323,6 +332,20 @@ impl Node {
         }
     }
 
+    /// get_payload blocks until the peer sends a matching message or closes. Without a
+    /// bound a silent peer hangs the crawl.
+    async fn get_payload_within(
+        &self,
+        stream: &mut TcpStream,
+        command: Option<[u8; 12]>,
+        within: Duration,
+    ) -> Result<Vec<u8>, Box<dyn Error>> {
+        match tokio::time::timeout(within, self.get_payload(stream, command)).await {
+            Ok(r) => r,
+            Err(_) => Err("timed out waiting for peer".into()),
+        }
+    }
+
     pub async fn get_block_height(&self, payload: &[u8]) -> Result<u32, Box<dyn Error>> {
         let mut payload = Cursor::new(payload);
         payload.read_exact(&mut [0u8; 80]).await?;
@@ -397,15 +420,21 @@ impl Node {
     
         let mut peers = HashMap::new();
     
-        // Get IP addresses of nodes peers
-        for _ in 0..3 {
-            self.send_getaddr(&mut stream).await?;
-            if let Ok(payload) = self.get_payload(&mut stream, Some(*b"addrv2\0\0\0\0\0\0")).await {
-                self.extract_ips(&payload, &mut peers).await?;
-            } else {
-                println!("Warning: Failed to receive addr response, continuing...");
-                continue;
+        // Ask once. Core answers a repeated getaddr by clearing vAddrToSend and starting
+        // over, so asking again mid-wait discards the reply being assembled. It splits
+        // large replies across messages, so drain until the peer goes quiet.
+        self.send_getaddr(&mut stream).await?;
+        loop {
+            match self
+                .get_payload_within(&mut stream, Some(*b"addrv2\0\0\0\0\0\0"), ADDR_WAIT)
+                .await
+            {
+                Ok(payload) => self.extract_ips(&payload, &mut peers).await?,
+                Err(_) => break,
             }
+        }
+        if peers.is_empty() {
+            println!("no addresses from {}", self.ip.as_ref());
         }
     
         // The census is complete here. Print it before anything that can fail or block,
