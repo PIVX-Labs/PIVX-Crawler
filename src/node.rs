@@ -6,6 +6,7 @@ use std::io::Cursor;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use futures_util::stream::{self, StreamExt};
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 
@@ -62,6 +63,10 @@ const MAX_PROTOCOL_MESSAGE_LENGTH: usize = 2 * 1024 * 1024;
 // AVG_ADDRESS_BROADCAST_INTERVAL of 30s (net_processing.cpp:2430, validation.h:109).
 // A wait shorter than the tail of that distribution reports an empty network.
 const ADDR_WAIT: Duration = Duration::from_secs(90);
+
+// Fork detection dials every reachable peer. Unbounded and serial it never returned.
+const PEER_PROBE_TIMEOUT: Duration = Duration::from_secs(12);
+const PEER_PROBE_CONCURRENCY: usize = 32;
 
 // MAX_SUBVERSION_LENGTH, PIVX Core.
 const MAX_SUBVERSION_LENGTH: u64 = 256;
@@ -453,27 +458,45 @@ impl Node {
             println!("explorer unreachable, skipping fork detection");
             return Ok((peers, HashMap::new()));
         };
-        // Map to store peer IPs with heights and recent hashes
-        let mut peer_updates: HashMap<Ip, (u32, Vec<BlockHash>)> = HashMap::new();
-        for peer_ip in peers.keys() {
-            // Onion, I2P and CJDNS need a proxy this process does not have. Dialling one
-            // buys a connect timeout and no data; it stays in the census regardless.
-            if !peer_ip.is_directly_dialable() {
-                continue;
-            }
-            // Connect once per peer
-            let Ok(mut peer_stream) = TcpStream::connect(format!("{}:{}", peer_ip.as_ref(), network().port)).await else {
-                println!("Failed to connect to peer {}", peer_ip.as_ref());
-                continue;
-            };
-            if self.handshake_with_peer(&mut peer_stream).await.is_err() {
-                println!("Handshake failed for peer {}", peer_ip.as_ref());
-                continue;
-            }
-            if let Ok(peer_hashes) = self.fetch_recent_block_hashes(&mut peer_stream, best_block_hash, 10).await {
-                peer_updates.insert(peer_ip.clone(), (peer_height, peer_hashes));
-            }
-        }
+        // Onion, I2P and CJDNS need a proxy this process does not have. They stay in the
+        // census; dialling one only buys a connect timeout.
+        let dialable: Vec<Ip> = peers
+            .keys()
+            .filter(|ip| ip.is_directly_dialable())
+            .cloned()
+            .collect();
+
+        // Serially and unbounded this never finished: an unreachable host blocks for the
+        // OS connect timeout, and a census runs to hundreds of peers.
+        let peer_updates: HashMap<Ip, (u32, Vec<BlockHash>)> = stream::iter(dialable)
+            .map(|peer_ip| async move {
+                let probe = async {
+                    let mut peer_stream =
+                        TcpStream::connect(format!("{}:{}", peer_ip.as_ref(), network().port))
+                            .await
+                            .ok()?;
+                    let probe_node = Node { ip: peer_ip.clone() };
+                    probe_node.handshake_with_peer(&mut peer_stream).await.ok()?;
+                    let hashes = probe_node
+                        .fetch_recent_block_hashes(&mut peer_stream, best_block_hash, 10)
+                        .await
+                        .ok()?;
+                    Some((peer_ip.clone(), (peer_height, hashes)))
+                };
+                tokio::time::timeout(PEER_PROBE_TIMEOUT, probe)
+                    .await
+                    .ok()
+                    .flatten()
+            })
+            .buffer_unordered(PEER_PROBE_CONCURRENCY)
+            .filter_map(|r| async move { r })
+            .collect()
+            .await;
+
+        println!(
+            "probed {} reachable peers for fork detection",
+            peer_updates.len()
+        );
         Ok((peers, peer_updates))
     }
     
@@ -711,8 +734,8 @@ pub fn group_peers_by_exact_hash(peers: &HashMap<Ip, (u32, Vec<BlockHash>)>) -> 
 }
 
 pub async fn fetch_latest_block_hash_from_explorer() -> Result<[u8; 32], Box<dyn Error>> {
-    let url = "https://explorer.duddino.com/api/status";
-    let res = reqwest::get(url).await?.json::<serde_json::Value>().await?;
+    let url = format!("{}/api/status", network().explorer);
+    let res = reqwest::get(&url).await?.json::<serde_json::Value>().await?;
 
     if let Some(hash_hex) = res["backend"]["bestBlockHash"].as_str() {
         let mut hash = [0u8; 32];
@@ -729,8 +752,8 @@ pub async fn fetch_latest_block_hash_from_explorer() -> Result<[u8; 32], Box<dyn
 }
 
 pub async fn fetch_latest_block_height_from_explorer() -> Result<u32, Box<dyn Error>> {
-    let url = "https://explorer.duddino.com/api/status";
-    let res = reqwest::get(url).await?.json::<serde_json::Value>().await?;
+    let url = format!("{}/api/status", network().explorer);
+    let res = reqwest::get(&url).await?.json::<serde_json::Value>().await?;
 
     if let Some(height) = res["backend"]["blocks"].as_u64() {
         Ok(height as u32)

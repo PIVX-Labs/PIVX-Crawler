@@ -9,12 +9,16 @@ use tokio::io::AsyncWriteExt;
 pub struct Network {
     pub magic: u32,
     pub port: u16,
+    /// Blockbook v2 compatible status endpoint. Fork detection needs a trusted tip, and
+    /// a mainnet explorer cannot supply one for testnet.
+    pub explorer: &'static str,
 }
 
 /// pchMessageStart and nDefaultPort from CMainParams, chainparams.cpp:318.
 pub const MAINNET: Network = Network {
     magic: 0x90c4fde9,
     port: 51472,
+    explorer: "https://explorer.pivx.org",
 };
 
 /// CTestNetParams, chainparams.cpp:464-467.
@@ -24,6 +28,7 @@ pub const MAINNET: Network = Network {
 pub const TESTNET: Network = Network {
     magic: 0xf6e7d6cb,
     port: 51474,
+    explorer: "https://testnet-explorer.liquid369.wtf",
 };
 
 static NETWORK: OnceLock<Network> = OnceLock::new();

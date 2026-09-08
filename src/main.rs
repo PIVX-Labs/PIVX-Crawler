@@ -10,7 +10,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use webhook::Webhook;
 
-// Usage: pivx-crawler [--testnet] [--magic=<hex>] [--walk[=max]] [--depth=N] [seed]
+// Usage: pivx-crawler [--testnet] [--magic=<hex>] [--walk[=max]] [--depth=N] [--explorer=<url>] [seed]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -21,6 +21,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
     if let Some(hex) = args.iter().find_map(|a| a.strip_prefix("--magic=")) {
         net.magic = u32::from_str_radix(hex, 16)?;
+    }
+    if let Some(url) = args.iter().find_map(|a| a.strip_prefix("--explorer=")) {
+        net.explorer = Box::leak(url.to_string().into_boxed_str());
     }
     message::set_network(net);
     // 194.195.87.248 no longer answers. A dead seed yields an empty result, not an
